@@ -1,0 +1,508 @@
+import String from "string"
+import Vector from "vector"
+import Exception from "exceptions"
+import SizeMaximum, Size from "types"
+import print, printLine from "io"
+import exit from "libc/lib/stdlib"
+
+#
+# TODO: refactor this to take advantadge of Alta's simple multiple inheritance
+#       we don't have the diamond inheritance problem ;)
+#
+# the current implementation is basically just a translation of the C++ code
+# i have implemented in the Alta compiler for argument parsing
+#
+# the current implementation of multiple inheritance in Alta would need to be fixed up, however, to make sure
+# we don't double construct the target parent
+#
+
+export class MissingArgumentValue extends Exception {}
+export class RequiredArgumentNotFound extends Exception {}
+export class TooManyValues extends Exception {}
+
+function indent(times: Size): String {
+	let result: String = ""
+	for i: Size in 0..times {
+		result += "  "
+	}
+	return result
+}
+
+class OptionBase {
+	public var short: String
+	public var long: String
+	public var description: String
+	public var required = false
+
+	protected @virtual function toBool(): bool {
+		return false
+	}
+
+	public constructor(short: String, long: String, description: String) {
+		this.short = short
+		this.long = long
+		this.description = description
+	}
+
+	public to bool {
+		return this.toBool()
+	}
+}
+
+export class Switch extends OptionBase {
+	module var _value: bool = false
+
+	public var extendedParsing = true
+
+	public constructor(short: String = "", long: String = "", description: String = "") {
+		super(short, long, description)
+	}
+
+	protected @override function toBool(): bool {
+		return this._value
+	}
+
+	public @read function value(): bool {
+		return this._value
+	}
+}
+
+export class Argument extends OptionBase {
+	module var _value: String? = null
+	module var _defaulted: bool = false
+
+	public var valueName: String
+	public var defaultValue: String? = null
+
+	public constructor(short: String = "", long: String = "", valueName: String = "", description: String = "", defaultValue: String? = null) {
+		super(short, long, description)
+		this.valueName = valueName
+		this.defaultValue = defaultValue
+	}
+
+	protected @override function toBool(): bool {
+		return this._value
+	}
+
+	public @read function value(): String? {
+		return this._value
+	}
+
+	public @read function defaulted(): bool {
+		return this._defaulted
+	}
+}
+
+export class MultiArgument extends OptionBase {
+	module var _values: Vector<String>
+
+	public var valueName: String
+
+	public constructor(short: String = "", long: String = "", valueName: String = "", description: String = "") {
+		super(short, long, description)
+		this.valueName = valueName
+	}
+
+	protected @override function toBool(): bool {
+		return this._values.length > 0
+	}
+
+	public @read function values(): Vector<String> {
+		return this._values
+	}
+}
+
+export class UnnamedArgument extends OptionBase {
+	module var _value: String? = null
+	module var _defaulted: bool = false
+
+	public var valueName: String
+	public var defaultValue: String? = null
+
+	public constructor(valueName: String = "", description: String = "", defaultValue: String? = null) {
+		super("", "", description)
+		this.valueName = valueName
+		this.defaultValue = defaultValue
+	}
+
+	protected @override function toBool(): bool {
+		return this._value
+	}
+
+	public @read function value(): String? {
+		return this._value
+	}
+
+	public @read function defaulted(): bool {
+		return this._defaulted
+	}
+}
+
+export class UnnamedMultiArgument extends OptionBase {
+	module var _values: Vector<String>
+
+	public var valueName: String
+
+	public constructor(valueName: String = "", description: String = "") {
+		super("", "", description)
+	}
+
+	protected @override function toBool(): bool {
+		return this._values.length > 0
+	}
+
+	public @read function values(): Vector<String> {
+		return this._values
+	}
+}
+
+export class ArgumentParser {
+	private var arguments: Vector<ptr OptionBase>
+	private var help = new Switch(
+		short: "h",
+		long: "help",
+		description: "Prints this help prompt and exits"
+	)
+	private var version = new Switch(
+		long: "version",
+		description: "Prints the program version and exits"
+	)
+	private var includeHelp = true
+	private var includeVersion = true
+
+	public var separator: String = "-"
+	public var repeatSeparator = true
+	public var argv0: String
+	public var programName: String
+	public var programSummary: String
+	public var programDescription: String
+	public var programVersion: String
+	public var unparsed: Vector<String>
+
+	public constructor(
+		argv0: String = "",
+		name: String = "",
+		summary: String = "",
+		description: String = "",
+		version: String = "",
+		includeHelp: bool = true,
+		includeVersion: bool = true,
+	) {
+		this.includeHelp = includeHelp
+		this.includeVersion = includeVersion
+
+		this.argv0 = argv0
+		this.programName = name
+		this.programSummary = summary
+		this.programDescription = description
+		this.programVersion = version
+
+		# we use `includeHelp` and `includeVersion` instead of adding the references to the argument vector
+		# because if the ArgumentParser is copied, those references would become invalid
+	}
+
+	public function add(argument: ref OptionBase): ref ArgumentParser {
+		this.arguments.push(&argument)
+		return this
+	}
+
+	public function parse(arguments: Vector<String>): ref ArgumentParser {
+		let waiting: ptr OptionBase = nullptr
+		let canParse = true
+
+		let argsToCheck = this.arguments
+		if this.includeHelp
+			argsToCheck.push(&this.help)
+		if this.includeVersion
+			argsToCheck.push(&this.version)
+
+		for str: String in arguments.items {
+			if canParse && str.startsWith(this.separator) {
+				if waiting {
+					# if the argument is...
+					if (
+						(
+							# ...a MultiArgument...
+							waiting instanceof MultiArgument &&
+							# ...with values
+							(waiting as ptr MultiArgument)._values.length > 0
+						) ||
+						# or
+						(
+							# ...an UnnamedMultiArgument...
+							waiting instanceof UnnamedMultiArgument &&
+							# ...with values
+							(waiting as ptr UnnamedMultiArgument)._values.length > 0
+						)
+					) {
+						# then stop waiting for it
+						waiting = nullptr
+					} else {
+						# otherwise, throw an error
+						throw new MissingArgumentValue
+					}
+				}
+
+				let includeShortID = true
+				let searchTarget = str.substring(from: this.separator.length)
+				let value: String? = null
+
+				if this.repeatSeparator && searchTarget.startsWith(this.separator) {
+					includeShortID = false
+					searchTarget = searchTarget.substring(from: this.separator.length)
+
+					if searchTarget.empty {
+						canParse = false
+						continue
+					}
+				}
+
+				let equalPosition = searchTarget.indexOf('=')
+				if equalPosition != SizeMaximum {
+					value = searchTarget.substring(from: equalPosition + 1)
+					searchTarget = searchTarget.substring(to: equalPosition)
+				}
+
+				let found = false
+				for opt: ptr OptionBase in argsToCheck.items {
+					if includeShortID && searchTarget == opt.short {
+						found = true
+					} else if searchTarget == opt.long {
+						found = true
+					} else {
+						continue
+					}
+
+					if let switch = opt as ptr Switch {
+						if value && switch.extendedParsing {
+							let comp = (*value).toLowerCase()
+							if comp == "0" || comp == "no" || comp == "false" || comp == "off" || comp == "n" {
+								switch._value = false
+							} else {
+								switch._value = true
+							}
+						} else {
+							switch._value = true
+						}
+					} else if !value {
+						waiting = opt
+					} else if let arg = opt as ptr Argument {
+						arg._value = value
+					} else if let arg = opt as ptr MultiArgument {
+						arg._values.push(*value)
+					}
+				}
+
+				# we should somehow warn users about when we don't find the flag (i.e. when `found == false`)
+				#
+				# we don't want to throw an error, though, because that would abort the entire parsing process;
+				# we just want to emit a warning
+				#
+				# recoverable/resumable exceptions are looking *pretty* appealing right now, not gonna lie
+				#
+				# we could probably emit a warning with something like an imitation of Node's EventEmitter,
+				# but that's best implemented after coroutines are implemented so that they can be scheduled to run
+				# independent of the `emit` call
+			} else if waiting {
+				if let arg = waiting as ptr Argument {
+					if arg._value
+						throw new TooManyValues
+
+					arg._value = str
+					waiting = nullptr
+				} else if let arg = waiting as ptr MultiArgument {
+					arg._values.push(str)
+				} else if let arg = waiting as ptr UnnamedMultiArgument {
+					arg._values.push(str)
+				}
+			} else {
+				let handled = false
+				for opt: ptr OptionBase in argsToCheck.items {
+					if let arg = opt as ptr UnnamedArgument {
+						if !arg._value {
+							arg._value = str
+							handled = true
+							break
+						}
+					} else if let arg = opt as ptr UnnamedMultiArgument {
+						arg._values.push(str)
+						waiting = arg
+						handled = true
+						break
+					}
+				}
+				if !handled
+					this.unparsed.push(str)
+			}
+		}
+
+		# same check as before
+		if waiting {
+			if (
+				(waiting instanceof MultiArgument && (waiting as ptr MultiArgument)._values.length > 0) ||
+				(waiting instanceof UnnamedMultiArgument && (waiting as ptr UnnamedMultiArgument)._values.length > 0)
+			) {
+				waiting = nullptr
+			} else {
+				throw new MissingArgumentValue
+			}
+		}
+
+		for opt: ptr OptionBase in argsToCheck.items {
+			if opt.required && !*opt {
+				throw new RequiredArgumentNotFound
+			} else if !opt.required && !*opt {
+				if let arg = opt as ptr Argument {
+					arg._value = arg.defaultValue
+					arg._defaulted = true
+				} else if let arg = opt as ptr UnnamedArgument {
+					arg._value = arg.defaultValue
+					arg._defaulted = true
+				}
+			}
+
+			if *opt && opt == &this.help {
+				printLine(this.programName, " - ", this.programSummary, " (", this.programVersion, ')')
+				printLine()
+				printLine("USAGE:")
+				printLine()
+				print(indent(1), this.argv0)
+
+				let hasUnnamed = false
+
+				for opt: ptr OptionBase in argsToCheck.items {
+					if opt instanceof UnnamedArgument || opt instanceof UnnamedMultiArgument {
+						hasUnnamed = true
+						continue
+					}
+
+					print(' ')
+
+					if !opt.required
+						print('[')
+
+					print(this.separator)
+					if !opt.short.empty {
+						print(opt.short)
+					} else {
+						if this.repeatSeparator
+							print(this.separator)
+						print(opt.long)
+					}
+
+					if let arg = opt as ptr Argument {
+						print(" <", arg.valueName, '>')
+					} else if let arg = opt as ptr MultiArgument {
+						print(" <", arg.valueName, ">...")
+					}
+
+					if !opt.required
+						print(']')
+				}
+
+				if hasUnnamed {
+					print(" [--]")
+					for opt: ptr OptionBase in argsToCheck.items {
+						if !(opt instanceof UnnamedArgument || opt instanceof UnnamedMultiArgument)
+							continue
+
+						print(' ', opt.required ? '<' : '[')
+
+						if let arg = opt as ptr UnnamedArgument {
+							print(arg.valueName)
+						} else if let arg = opt as ptr UnnamedMultiArgument {
+							print(arg.valueName)
+						}
+
+						print(opt.required ? '>' : ']')
+
+						if opt instanceof UnnamedMultiArgument
+							print("...")
+					}
+				}
+
+				printLine() # ends the usage line
+
+				printLine()
+				printLine()
+
+				printLine("DESCRIPTION:")
+				printLine(this.programDescription)
+
+				printLine()
+				printLine()
+
+				printLine("ARGUMENTS:")
+				for opt: ptr OptionBase in argsToCheck.items {
+					if opt instanceof UnnamedArgument || opt instanceof UnnamedMultiArgument
+						continue
+					print(indent(1))
+					if !opt.short.empty {
+						print(this.separator, opt.short)
+						if let arg = opt as ptr Argument {
+							print(" <", arg.valueName, '>')
+						} else if let arg = opt as ptr MultiArgument {
+							print(" <", arg.valueName, '>')
+						}
+					}
+					if !opt.long.empty {
+						if !opt.short.empty
+							print(", ")
+						if this.repeatSeparator
+							print(this.separator)
+						print(this.separator, opt.long)
+						if let arg = opt as ptr Argument {
+							print(" <", arg.valueName, '>')
+						} else if let arg = opt as ptr MultiArgument {
+							print(" <", arg.valueName, '>')
+						}
+					}
+
+					printLine()
+
+					if opt instanceof MultiArgument
+						printLine(indent(2), "Accepts multiple values")
+					if opt.required
+						printLine(indent(2), "Is required")
+					if let arg = opt as ptr Argument
+						if arg.defaultValue
+							printLine(indent(2), "Defaults to: ", *arg.defaultValue)
+
+					printLine(indent(2), opt.description)
+				}
+				for opt: ptr OptionBase in argsToCheck.items {
+					if !(opt instanceof UnnamedArgument || opt instanceof UnnamedMultiArgument)
+						continue
+
+					print(' ', opt.required ? '<' : '[')
+
+					if let arg = opt as ptr UnnamedArgument {
+						print(arg.valueName)
+					} else if let arg = opt as ptr UnnamedMultiArgument {
+						print(arg.valueName)
+					}
+
+					print(opt.required ? '>' : ']')
+
+					printLine()
+
+					if opt instanceof UnnamedMultiArgument
+						printLine(indent(2), "Accepts multiple values")
+					if opt.required
+						printLine(indent(2), "Is required")
+					if let arg = opt as ptr UnnamedArgument
+						if arg.defaultValue
+							printLine(indent(2), "Defaults to: ", *arg.defaultValue)
+
+					printLine(indent(2), opt.description)
+				}
+				exit(0)
+			} else if *opt && opt == &this.version {
+				printLine(this.programName, " - ", this.programSummary, " (", this.programVersion, ')')
+				exit(0)
+			}
+		}
+
+		return this
+	}
+}
